@@ -8,8 +8,16 @@ import android.os.Build;
 import java.io.IOException;
 import java.util.List;
 import java.util.Locale;
+import java.lang.System;
+
+import java.io.ByteArrayOutputStream;
+import java.io.FileDescriptor;
+
+import android.os.Handler;
 
 public final class Server {
+
+    private static Handler handler;
 
     private Server() {
         // not instantiable
@@ -61,6 +69,7 @@ public final class Server {
     }
 
     private static void scrcpy(Options options) throws IOException {
+        AccessibilityNodeInfoDumper dumper = null;
         Ln.i("Device: " + Build.MANUFACTURER + " " + Build.MODEL + " (Android " + Build.VERSION.RELEASE + ")");
         final Device device = new Device(options);
         List<CodecOption> codecOptions = options.getCodecOptions();
@@ -72,21 +81,29 @@ public final class Server {
         boolean sendDummyByte = options.getSendDummyByte();
 
         try (DesktopConnection connection = DesktopConnection.open(tunnelForward, control, sendDummyByte)) {
-            if (options.getSendDeviceMeta()) {
-                Size videoSize = device.getScreenInfo().getVideoSize();
-                connection.sendDeviceMeta(Device.getDeviceName(), videoSize.getWidth(), videoSize.getHeight());
+            ScreenEncoder screenEncoder = new ScreenEncoder(options, device);
+            handler = screenEncoder.getHandler();
+//            if (options.getSendDeviceMeta()) {
+//                Size videoSize = device.getScreenInfo().getVideoSize();
+//                connection.sendDeviceMeta(Device.getDeviceName(), videoSize.getWidth(), videoSize.getHeight());
+//            }
+//            ScreenEncoder screenEncoder = new ScreenEncoder(options.getSendFrameMeta(), options.getBitRate(), options.getMaxFps(), codecOptions,
+//                    options.getEncoderName(), options.getDownsizeOnError());
+////            screenEncoder.getHandler();
+//
+//            Thread controllerThread = null;
+//            Thread deviceMessageSenderThread = null;
+            if (options.getDumpHierarchy()) {
+                dumper = new AccessibilityNodeInfoDumper(handler, device, connection);
+                dumper.start();
             }
-            ScreenEncoder screenEncoder = new ScreenEncoder(options.getSendFrameMeta(), options.getBitRate(), options.getMaxFps(), codecOptions,
-                    options.getEncoderName(), options.getDownsizeOnError());
-
-            Thread controllerThread = null;
-            Thread deviceMessageSenderThread = null;
             if (control) {
+//                Controller controller = new Controller(device, connection);
                 final Controller controller = new Controller(device, connection, options.getClipboardAutosync(), options.getPowerOn());
 
                 // asynchronous
-                controllerThread = startController(controller);
-                deviceMessageSenderThread = startDeviceMessageSender(controller.getSender());
+                startController(controller);
+                startDeviceMessageSender(controller.getSender());
 
                 device.setClipboardListener(new Device.ClipboardListener() {
                     @Override
@@ -98,18 +115,24 @@ public final class Server {
 
             try {
                 // synchronous
-                screenEncoder.streamScreen(device, connection.getVideoFd());
+//                screenEncoder.streamScreen(device, connection.getVideoFd());
+                screenEncoder.streamScreen(device, connection.getVideoChannel());
             } catch (IOException e) {
                 // this is expected on close
+                Ln.i("exit: " + e.getMessage());
                 Ln.d("Screen streaming stopped");
             } finally {
                 initThread.interrupt();
-                if (controllerThread != null) {
-                    controllerThread.interrupt();
+                if (options.getDumpHierarchy() && dumper != null) {
+                    dumper.stop();
                 }
-                if (deviceMessageSenderThread != null) {
-                    deviceMessageSenderThread.interrupt();
-                }
+                System.exit(0);
+//                if (controllerThread != null) {
+//                    controllerThread.interrupt();
+//                }
+//                if (deviceMessageSenderThread != null) {
+//                    deviceMessageSenderThread.interrupt();
+//                }
             }
         }
     }
@@ -134,6 +157,7 @@ public final class Server {
                 } catch (IOException e) {
                     // this is expected on close
                     Ln.d("Controller stopped");
+                    Common.stopScrcpy(handler, "control");
                 }
             }
         });
@@ -169,6 +193,22 @@ public final class Server {
         }
 
         Options options = new Options();
+
+        options.setMaxSize(0);
+        options.setTunnelForward(true);
+        options.setCrop(null);
+        options.setControl(true);
+        // global
+        options.setMaxFps(24);
+        options.setScale(480);
+        // jpeg
+        options.setQuality(60);
+        options.setBitRate(1000000);
+        options.setSendFrameMeta(true);
+        // control
+        options.setControlOnly(false);
+        // dump
+        options.setDumpHierarchy(false);
 
         for (int i = 1; i < args.length; ++i) {
             String arg = args[i];
@@ -281,6 +321,98 @@ public final class Server {
         return options;
     }
 
+//    private static Options customOptions(String... args) {
+//        org.apache.commons.cli.CommandLine commandLine = null;
+//        org.apache.commons.cli.CommandLineParser parser = new org.apache.commons.cli.BasicParser();
+//        org.apache.commons.cli.Options options = new org.apache.commons.cli.Options();
+//        options.addOption("Q", true, "JPEG quality (0-100)");
+//        options.addOption("r", true, "Frame rate (frames/s)");
+//        options.addOption("P", true, "Display projection (1080, 720, 480...).");
+//        options.addOption("c", false, "Control only");
+//        options.addOption("L", false, "Library path");
+//        options.addOption("D", false, "Dump window hierarchy");
+//        options.addOption("h", false, "Show help");
+//        try {
+//            commandLine = parser.parse(options, args);
+//        } catch (Exception e) {
+//            Ln.e(e.getMessage());
+//            System.exit(0);
+//        }
+//
+//        if (commandLine.hasOption('h')) {
+//            System.out.println(
+//                    "Usage: [-h]\n\n"
+//                            + "jpeg:\n"
+//                            + "  -r <value>:    Frame rate (frames/sec).\n"
+//                            + "  -P <value>:    Display projection (1080, 720, 480, 360...).\n"
+//                            + "  -Q <value>:    JPEG quality (0-100).\n"
+//                            + "\n"
+//                            + "  -c:            Control only.\n"
+//                            + "  -L:            Library path.\n"
+//                            + "  -D:            Dump window hierarchy.\n"
+//                            + "  -h:            Show help.\n"
+//            );
+//            System.exit(0);
+//        }
+//        if (commandLine.hasOption('L')) {
+//            System.out.println(System.getProperty("java.library.path"));
+//            System.exit(0);
+//        }
+//        Options o = new Options();
+//        o.setMaxSize(0);
+//        o.setTunnelForward(true);
+//        o.setCrop(null);
+//        o.setControl(true);
+//        // global
+//        o.setMaxFps(24);
+//        o.setScale(480);
+//        // jpeg
+//        o.setQuality(60);
+//        o.setBitRate(1000000);
+//        o.setSendFrameMeta(true);
+//        // control
+//        o.setControlOnly(false);
+//        // dump
+//        o.setDumpHierarchy(false);
+//        if (commandLine.hasOption('Q')) {
+//            int i = 0;
+//            try {
+//                i = Integer.parseInt(commandLine.getOptionValue('Q'));
+//            } catch (Exception e) {
+//            }
+//            if (i > 0 && i <= 100) {
+//                o.setQuality(i);
+//            }
+//        }
+//        if (commandLine.hasOption('r')) {
+//            int i = 0;
+//            try {
+//                i = Integer.parseInt(commandLine.getOptionValue('r'));
+//            } catch (Exception e) {
+//            }
+//            if (i > 0 && i <= 100) {
+//                o.setMaxFps(i);
+//            }
+//        }
+//        if (commandLine.hasOption('P')) {
+//            int i = 0;
+//            try {
+//                i = Integer.parseInt(commandLine.getOptionValue('P'));
+//            } catch (Exception e) {
+//            }
+//            if (i > 0) {
+//                o.setScale(i);
+//            }
+//        }
+//        if (commandLine.hasOption('c')) {
+//            o.setControlOnly(true);
+//        }
+//        if (commandLine.hasOption('D')) {
+//            o.setDumpHierarchy(true);
+//        }
+//        return o;
+//    }
+
     private static Rect parseCrop(String crop) {
         if (crop.isEmpty()) {
             return null;
@@ -331,6 +463,10 @@ public final class Server {
         Options options = createOptions(args);
 
         Ln.initLogLevel(options.getLogLevel());
+        Ln.i("Options frame rate: " + options.getMaxFps() + " (1 ~ 60)");
+        Ln.i("Options quality: " + options.getQuality() + " (1 ~ 100)");
+        Ln.i("Options projection: " + options.getScale() + " (1080, 720, 480, 360...)");
+        Ln.i("Options control only: " + options.getControlOnly() + " (true / false)");
 
         scrcpy(options);
     }

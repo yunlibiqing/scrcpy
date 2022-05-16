@@ -29,6 +29,12 @@ public class Options {
     private boolean sendFrameMeta = true; // send PTS so that the client may record properly
     private boolean sendDummyByte = true; // write a byte on start to detect connection issues
 
+    private int quality;
+    private int scale;
+    private boolean controlOnly;
+    private boolean nalu;
+    private boolean dumpHierarchy;
+
     public Ln.Level getLogLevel() {
         return logLevel;
     }
@@ -195,5 +201,45 @@ public class Options {
 
     public void setSendDummyByte(boolean sendDummyByte) {
         this.sendDummyByte = sendDummyByte;
+    }
+
+    public boolean getControlOnly() {
+        return controlOnly;
+    }
+
+    public void setControlOnly(boolean controlOnly) {
+        this.controlOnly = controlOnly;
+    }
+
+    public boolean getNALU() {
+        return nalu;
+    }
+
+    public void setNALU(boolean nalu) {
+        this.nalu = nalu;
+    }
+
+    public boolean getDumpHierarchy() {
+        return dumpHierarchy;
+    }
+
+    public void setDumpHierarchy(boolean dumpHierarchy) {
+        this.dumpHierarchy = dumpHierarchy;
+    }
+
+    public int getQuality() {
+        return quality;
+    }
+
+    public void setQuality(int quality) {
+        this.quality = quality;
+    }
+
+    public int getScale() {
+        return scale;
+    }
+
+    public void setScale(int scale) {
+        this.scale = scale;
     }
 }

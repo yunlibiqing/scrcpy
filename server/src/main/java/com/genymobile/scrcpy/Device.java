@@ -160,6 +160,8 @@ public final class Device {
 
         Size clientVideoSize = devicePosition.getScreenSize();
         if (!unlockedVideoSize.equals(clientVideoSize)) {
+            Ln.i("video width: " + unlockedVideoSize.getWidth() + ", video height: " + unlockedVideoSize.getHeight());
+            Ln.i("client width: " + clientVideoSize.getWidth() + ", client height: " + clientVideoSize.getHeight());
             // The client sends a click relative to a video with wrong dimensions,
             // the device may have been rotated since the event was generated, so ignore the event
             return null;
@@ -173,6 +175,10 @@ public final class Device {
 
     public static String getDeviceName() {
         return Build.MODEL;
+    }
+
+    public int getRotation() {
+        return SERVICE_MANAGER.getWindowManager().getRotation();
     }
 
     public static boolean supportsInputEvents(int displayId) {

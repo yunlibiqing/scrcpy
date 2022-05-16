@@ -2,6 +2,8 @@ package com.genymobile.scrcpy;
 
 import com.genymobile.scrcpy.wrappers.SurfaceControl;
 
+import android.graphics.ImageFormat;
+import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
@@ -9,8 +11,16 @@ import android.media.MediaCodecList;
 import android.media.MediaFormat;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.Process;
 import android.view.Surface;
+import android.media.ImageReader;
+import android.graphics.Bitmap;
+import android.media.Image;
+import android.os.Handler;
+import android.os.Message;
 
+import java.nio.ByteOrder;
+import java.io.ByteArrayOutputStream;
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -18,6 +28,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import android.os.HandlerThread;
+
+import java.nio.channels.SocketChannel;
 
 public class ScreenEncoder implements Device.RotationListener {
 
@@ -32,105 +47,329 @@ public class ScreenEncoder implements Device.RotationListener {
     private static final long PACKET_FLAG_KEY_FRAME = 1L << 62;
 
     private final AtomicBoolean rotationChanged = new AtomicBoolean();
+    private final AtomicInteger mRotation = new AtomicInteger(0);
     private final ByteBuffer headerBuffer = ByteBuffer.allocate(12);
 
-    private final String encoderName;
-    private final List<CodecOption> codecOptions;
+//    private final String encoderName;
+//    private final List<CodecOption> codecOptions;
     private final int bitRate;
     private final int maxFps;
-    private final boolean sendFrameMeta;
-    private final boolean downsizeOnError;
+//    private final boolean sendFrameMeta;
+//    private final boolean downsizeOnError;
     private long ptsOrigin;
 
     private boolean firstFrameSent;
+    private ImageReader mImageReader;
 
-    public ScreenEncoder(boolean sendFrameMeta, int bitRate, int maxFps, List<CodecOption> codecOptions, String encoderName,
-            boolean downsizeOnError) {
-        this.sendFrameMeta = sendFrameMeta;
-        this.bitRate = bitRate;
-        this.maxFps = maxFps;
-        this.codecOptions = codecOptions;
-        this.encoderName = encoderName;
-        this.downsizeOnError = downsizeOnError;
+    private int quality;
+    private int scale;
+    private boolean controlOnly;
+    private HandlerThread mHandlerThread;
+
+    private Handler mHandler;
+    private ImageReader.OnImageAvailableListener imageAvailableListenerImpl;
+
+    private Device device;
+    private final Object rotationLock = new Object();
+    private final Object imageReaderLock = new Object();
+    private boolean bImageReaderDisable = true;//Segmentation fault
+
+    private boolean alive = true;
+
+//    public ScreenEncoder(boolean sendFrameMeta, int bitRate, int maxFps, List<CodecOption> codecOptions, String encoderName,
+//            boolean downsizeOnError) {
+//        this.sendFrameMeta = sendFrameMeta;
+//        this.bitRate = bitRate;
+//        this.maxFps = maxFps;
+//        this.codecOptions = codecOptions;
+//        this.encoderName = encoderName;
+//        this.downsizeOnError = downsizeOnError;
+//    }
+
+    public ScreenEncoder(Options options, Device device/*int rotation*/) {
+        this.quality = options.getQuality();
+        this.maxFps = options.getMaxFps();
+        this.scale = options.getScale();
+        this.controlOnly = options.getControlOnly();
+        this.bitRate = options.getBitRate();
+        this.device = device;
+        mRotation.set(device.getRotation());
+
+        mHandlerThread = new HandlerThread("ScrcpyImageReaderHandlerThread");
+        mHandlerThread.start();
+        mHandler = new Handler(mHandlerThread.getLooper()) {
+            @Override
+            public void handleMessage(Message msg) {
+                Ln.i("hander message: " + msg);
+                if (msg.what == 1) {//exit
+                    setAlive(false);
+                    synchronized (rotationLock) {
+                        rotationLock.notify();
+                    }
+                }
+            }
+        };
     }
 
     @Override
     public void onRotationChanged(int rotation) {
+        Ln.i("rotation: " + rotation);
+        mRotation.set(rotation);
         rotationChanged.set(true);
+        synchronized (rotationLock) {
+            rotationLock.notify();
+        }
     }
 
     public boolean consumeRotationChange() {
         return rotationChanged.getAndSet(false);
     }
 
-    public void streamScreen(Device device, FileDescriptor fd) throws IOException {
-        Workarounds.prepareMainLooper();
-        if (Build.BRAND.equalsIgnoreCase("meizu")) {
-            // <https://github.com/Genymobile/scrcpy/issues/240>
-            // <https://github.com/Genymobile/scrcpy/issues/2656>
-            Workarounds.fillAppInfo();
+    private class ImageAvailableListenerImpl implements ImageReader.OnImageAvailableListener {
+        Handler handler;
+        SocketChannel fd;
+        Device device;
+        int type = 0;// 0:libjpeg-turbo 1:bitmap
+        int quality;
+        int framePeriodMs;
+
+        int count = 0;
+        long lastTime = System.currentTimeMillis();
+        long timeA = lastTime;
+
+        public ImageAvailableListenerImpl(Handler handler, Device device, SocketChannel fd, int frameRate, int quality) {
+            this.handler = handler;
+            this.fd = fd;
+            this.device = device;
+            this.quality = quality;
+            this.framePeriodMs = (int) (1000 / frameRate);
         }
 
-        internalStreamScreen(device, fd);
+        @Override
+        public void onImageAvailable(ImageReader imageReader) {
+            byte[] jpegData = null;
+            byte[] jpegSize = null;
+            Image image = null;
+
+            synchronized (imageReaderLock) {
+                try {
+                    if (bImageReaderDisable) {
+                        Ln.i("bImageReaderDisable !!!!!!!!!");
+                        return;
+                    }
+                    image = imageReader.acquireLatestImage();
+                    if (image == null) {
+                        return;
+                    }
+
+                    long currentTime = System.currentTimeMillis();
+                    if (framePeriodMs > currentTime - lastTime) {
+                        return;
+                    }
+                    lastTime = currentTime;
+
+                    int width = image.getWidth();
+                    int height = image.getHeight();
+                    int format = image.getFormat();//RGBA_8888 0x00000001
+                    final Image.Plane[] planes = image.getPlanes();
+                    final ByteBuffer buffer = planes[0].getBuffer();
+                    int pixelStride = planes[0].getPixelStride();
+                    int rowStride = planes[0].getRowStride();
+                    int rowPadding = rowStride - pixelStride * width;
+                    int pitch = width + rowPadding / pixelStride;
+//                    Ln.i("pitch: " + pitch + ", pixelStride: " + pixelStride + ", rowStride: " + rowStride + ", rowPadding: " + rowPadding);
+                    if (type == 0) {
+                        jpegData = JpegEncoder.compress(buffer, width, pitch, height, quality);
+                    } else if (type == 1) {
+                        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+                        Bitmap bitmap = Bitmap.createBitmap(pitch, height, Bitmap.Config.ARGB_8888);
+                        bitmap.copyPixelsFromBuffer(buffer);
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream);
+                        jpegData = stream.toByteArray();
+                        bitmap.recycle();
+                    }
+                    if (jpegData == null) {
+                        Ln.e("jpegData is null");
+                        return;
+                    }
+                    ByteBuffer b = ByteBuffer.allocate(4 + jpegData.length);
+                    b.order(ByteOrder.LITTLE_ENDIAN);
+                    b.putInt(jpegData.length);
+                    b.put(jpegData);
+                    jpegSize = b.array();
+                    try {
+                        IO.writeFully(fd, jpegSize, 0, jpegSize.length);// IOException
+                    } catch (IOException e) {
+                        Common.stopScrcpy(handler, "image");
+                    }
+                } catch (Exception e) {
+                    Ln.e("onImageAvailable: " + e.getMessage());
+                } finally {
+                    if (image != null) {
+                        image.close();
+                    }
+                }
+            }
+
+            count++;
+            long timeB = System.currentTimeMillis();
+            if (timeB - timeA >= 1000) {
+                timeA = timeB;
+                Ln.i("frame rate: " + count + ", jpeg size: " + jpegSize.length);
+                count = 0;
+            }
+        }
     }
 
-    private void internalStreamScreen(Device device, FileDescriptor fd) throws IOException {
-        MediaFormat format = createFormat(bitRate, maxFps, codecOptions);
+    public Handler getHandler() {
+        return mHandler;
+    }
+
+//    public void streamScreen(Device device, FileDescriptor fd) throws IOException {
+//        Workarounds.prepareMainLooper();
+//        if (Build.BRAND.equalsIgnoreCase("meizu")) {
+//            // <https://github.com/Genymobile/scrcpy/issues/240>
+//            // <https://github.com/Genymobile/scrcpy/issues/2656>
+//            Workarounds.fillAppInfo();
+//        }
+//
+//        internalStreamScreen(device, fd);
+//    }
+
+    public void streamScreen(Device device, SocketChannel fd) throws IOException {
+        Workarounds.prepareMainLooper();
+        Workarounds.fillAppInfo();
+
         device.setRotationListener(this);
         boolean alive;
         try {
+            writeMinicapBanner(device, fd, scale);
             do {
-                MediaCodec codec = createCodec(encoderName);
-                IBinder display = createDisplay();
-                ScreenInfo screenInfo = device.getScreenInfo();
-                Rect contentRect = screenInfo.getContentRect();
-                // include the locked video orientation
-                Rect videoRect = screenInfo.getVideoSize().toRect();
-                // does not include the locked video orientation
-                Rect unlockedVideoRect = screenInfo.getUnlockedVideoSize().toRect();
-                int videoRotation = screenInfo.getVideoRotation();
-                int layerStack = device.getLayerStack();
-                setSize(format, videoRect.width(), videoRect.height());
-
-                Surface surface = null;
-                try {
-                    configure(codec, format);
-                    surface = codec.createInputSurface();
-                    setDisplaySurface(display, surface, videoRotation, contentRect, unlockedVideoRect, layerStack);
-                    codec.start();
-
-                    alive = encode(codec, fd);
-                    // do not call stop() on exception, it would trigger an IllegalStateException
-                    codec.stop();
-                } catch (IllegalStateException | IllegalArgumentException e) {
-                    Ln.e("Encoding error: " + e.getClass().getName() + ": " + e.getMessage());
-                    if (!downsizeOnError || firstFrameSent) {
-                        // Fail immediately
-                        throw e;
+                writeRotation(fd);
+                if (controlOnly) {
+                    synchronized (rotationLock) {
+                        try {
+                            rotationLock.wait();
+                        } catch (InterruptedException e) {
+                        }
                     }
-
-                    int newMaxSize = chooseMaxSizeFallback(screenInfo.getVideoSize());
-                    if (newMaxSize == 0) {
-                        // Definitively fail
-                        throw e;
+                } else {
+                    IBinder display = createDisplay();
+                    Rect contentRect = device.getScreenInfo().getContentRect();
+//                    Rect videoRect = device.getScreenInfo().getVideoSize().toRect();
+                    Rect videoRect = getDesiredSize(contentRect, scale);
+                    synchronized (imageReaderLock) {
+                        mImageReader = ImageReader.newInstance(videoRect.width(), videoRect.height(), PixelFormat.RGBA_8888, 2);
+//                        ImageFormat.UNKNOWN, ImageFormat.RGB_565, ImageFormat.YV12, ImageFormat.Y8, ImageFormat.NV16, ImageFormat.NV21, ImageFormat.YUY2, ImageFormat.JPEG, ImageFormat.DEPTH_JPEG, ImageFormat.YUV_420_888, ImageFormat.YUV_422_888, ImageFormat.YUV_444_888, ImageFormat.FLEX_RGB_888, ImageFormat.FLEX_RGBA_8888, ImageFormat.RAW_SENSOR, ImageFormat.RAW_PRIVATE, ImageFormat.RAW10, ImageFormat.RAW12, ImageFormat.DEPTH16, ImageFormat.DEPTH_POINT_CLOUD, ImageFormat.PRIVATE, ImageFormat.HEIC;
+                        bImageReaderDisable = false;
                     }
-
-                    // Retry with a smaller device size
-                    Ln.i("Retrying with -m" + newMaxSize + "...");
-                    device.setMaxSize(newMaxSize);
-                    alive = true;
-                } finally {
+                    if (imageAvailableListenerImpl == null) {
+                        imageAvailableListenerImpl = new ImageAvailableListenerImpl(mHandler, device, fd, maxFps, quality);
+                    }
+                    mImageReader.setOnImageAvailableListener(imageAvailableListenerImpl, mHandler);
+                    Surface surface = mImageReader.getSurface();
+                    setDisplaySurface(display, surface, contentRect, videoRect);
+                    synchronized (rotationLock) {
+                        try {
+                            rotationLock.wait();
+                        } catch (InterruptedException e) {
+                        }
+                    }
+                    synchronized (imageReaderLock) {
+                        if (mImageReader != null) {
+                            bImageReaderDisable = true;
+                            mImageReader.close();
+                        }
+                    }
                     destroyDisplay(display);
-                    codec.release();
-                    if (surface != null) {
-                        surface.release();
-                    }
+                    surface.release();
                 }
+                alive = getAlive();
+                Ln.i("alive: " + alive);
             } while (alive);
+        } catch (Exception e) {
+            e.printStackTrace();
+            Ln.e("streamScreen: " + e.getMessage());
         } finally {
+            if (mHandlerThread != null) {
+                mHandlerThread.quit();
+            }
             device.setRotationListener(null);
         }
     }
+
+
+
+    private void writeRotation(SocketChannel fd) {
+        ByteBuffer r = ByteBuffer.allocate(8);
+        r.order(ByteOrder.LITTLE_ENDIAN);
+        r.putInt(4);
+        r.putInt(mRotation.get());
+        byte[] rArray = r.array();
+        try {
+            IO.writeFully(fd, rArray, 0, rArray.length);// IOException
+        } catch (IOException e) {
+            Common.stopScrcpy(getHandler(), "rotation");
+        }
+    }
+
+//    private void internalStreamScreen(Device device, FileDescriptor fd) throws IOException {
+//        MediaFormat format = createFormat(bitRate, maxFps, codecOptions);
+//        device.setRotationListener(this);
+//        boolean alive;
+//        try {
+//            do {
+//                MediaCodec codec = createCodec(encoderName);
+//                IBinder display = createDisplay();
+//                ScreenInfo screenInfo = device.getScreenInfo();
+//                Rect contentRect = screenInfo.getContentRect();
+//                // include the locked video orientation
+//                Rect videoRect = screenInfo.getVideoSize().toRect();
+//                // does not include the locked video orientation
+//                Rect unlockedVideoRect = screenInfo.getUnlockedVideoSize().toRect();
+//                int videoRotation = screenInfo.getVideoRotation();
+//                int layerStack = device.getLayerStack();
+//                setSize(format, videoRect.width(), videoRect.height());
+//
+//                Surface surface = null;
+//                try {
+//                    configure(codec, format);
+//                    surface = codec.createInputSurface();
+//                    setDisplaySurface(display, surface, videoRotation, contentRect, unlockedVideoRect, layerStack);
+//                    codec.start();
+//
+//                    alive = encode(codec, fd);
+//                    // do not call stop() on exception, it would trigger an IllegalStateException
+//                    codec.stop();
+//                } catch (IllegalStateException | IllegalArgumentException e) {
+//                    Ln.e("Encoding error: " + e.getClass().getName() + ": " + e.getMessage());
+//                    if (!downsizeOnError || firstFrameSent) {
+//                        // Fail immediately
+//                        throw e;
+//                    }
+//
+//                    int newMaxSize = chooseMaxSizeFallback(screenInfo.getVideoSize());
+//                    if (newMaxSize == 0) {
+//                        // Definitively fail
+//                        throw e;
+//                    }
+//
+//                    // Retry with a smaller device size
+//                    Ln.i("Retrying with -m" + newMaxSize + "...");
+//                    device.setMaxSize(newMaxSize);
+//                    alive = true;
+//                } finally {
+//                    destroyDisplay(display);
+//                    codec.release();
+//                    if (surface != null) {
+//                        surface.release();
+//                    }
+//                }
+//            } while (alive);
+//        } finally {
+//            device.setRotationListener(null);
+//        }
+//    }
 
     private static int chooseMaxSizeFallback(Size failedSize) {
         int currentMaxSize = Math.max(failedSize.getWidth(), failedSize.getHeight());
@@ -144,62 +383,62 @@ public class ScreenEncoder implements Device.RotationListener {
         return 0;
     }
 
-    private boolean encode(MediaCodec codec, FileDescriptor fd) throws IOException {
-        boolean eof = false;
-        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+//    private boolean encode(MediaCodec codec, FileDescriptor fd) throws IOException {
+//        boolean eof = false;
+//        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+//
+//        while (!consumeRotationChange() && !eof) {
+//            int outputBufferId = codec.dequeueOutputBuffer(bufferInfo, -1);
+//            eof = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+//            try {
+//                if (consumeRotationChange()) {
+//                    // must restart encoding with new size
+//                    break;
+//                }
+//                if (outputBufferId >= 0) {
+//                    ByteBuffer codecBuffer = codec.getOutputBuffer(outputBufferId);
+//
+//                    if (sendFrameMeta) {
+//                        writeFrameMeta(fd, bufferInfo, codecBuffer.remaining());
+//                    }
+//
+//                    IO.writeFully(fd, codecBuffer);
+//                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+//                        // If this is not a config packet, then it contains a frame
+//                        firstFrameSent = true;
+//                    }
+//                }
+//            } finally {
+//                if (outputBufferId >= 0) {
+//                    codec.releaseOutputBuffer(outputBufferId, false);
+//                }
+//            }
+//        }
+//
+//        return !eof;
+//    }
 
-        while (!consumeRotationChange() && !eof) {
-            int outputBufferId = codec.dequeueOutputBuffer(bufferInfo, -1);
-            eof = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
-            try {
-                if (consumeRotationChange()) {
-                    // must restart encoding with new size
-                    break;
-                }
-                if (outputBufferId >= 0) {
-                    ByteBuffer codecBuffer = codec.getOutputBuffer(outputBufferId);
-
-                    if (sendFrameMeta) {
-                        writeFrameMeta(fd, bufferInfo, codecBuffer.remaining());
-                    }
-
-                    IO.writeFully(fd, codecBuffer);
-                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
-                        // If this is not a config packet, then it contains a frame
-                        firstFrameSent = true;
-                    }
-                }
-            } finally {
-                if (outputBufferId >= 0) {
-                    codec.releaseOutputBuffer(outputBufferId, false);
-                }
-            }
-        }
-
-        return !eof;
-    }
-
-    private void writeFrameMeta(FileDescriptor fd, MediaCodec.BufferInfo bufferInfo, int packetSize) throws IOException {
-        headerBuffer.clear();
-
-        long pts;
-        if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-            pts = PACKET_FLAG_CONFIG; // non-media data packet
-        } else {
-            if (ptsOrigin == 0) {
-                ptsOrigin = bufferInfo.presentationTimeUs;
-            }
-            pts = bufferInfo.presentationTimeUs - ptsOrigin;
-            if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) {
-                pts |= PACKET_FLAG_KEY_FRAME;
-            }
-        }
-
-        headerBuffer.putLong(pts);
-        headerBuffer.putInt(packetSize);
-        headerBuffer.flip();
-        IO.writeFully(fd, headerBuffer);
-    }
+//    private void writeFrameMeta(FileDescriptor fd, MediaCodec.BufferInfo bufferInfo, int packetSize) throws IOException {
+//        headerBuffer.clear();
+//
+//        long pts;
+//        if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+//            pts = PACKET_FLAG_CONFIG; // non-media data packet
+//        } else {
+//            if (ptsOrigin == 0) {
+//                ptsOrigin = bufferInfo.presentationTimeUs;
+//            }
+//            pts = bufferInfo.presentationTimeUs - ptsOrigin;
+//            if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) {
+//                pts |= PACKET_FLAG_KEY_FRAME;
+//            }
+//        }
+//
+//        headerBuffer.putLong(pts);
+//        headerBuffer.putInt(packetSize);
+//        headerBuffer.flip();
+//        IO.writeFully(fd, headerBuffer);
+//    }
 
     private static MediaCodecInfo[] listEncoders() {
         List<MediaCodecInfo> result = new ArrayList<>();
@@ -278,6 +517,68 @@ public class ScreenEncoder implements Device.RotationListener {
         return SurfaceControl.createDisplay("scrcpy", secure);
     }
 
+    private Rect getDesiredSize(Rect contentRect, int resolution) {
+        int realWidth = contentRect.width();
+        int realHeight = contentRect.height();
+        int desiredWidth = realWidth;
+        int desiredHeight = realHeight;
+        int h = realHeight;
+        if (realWidth < realHeight) {
+            h = realWidth;
+        }
+        if (h > resolution) {
+            desiredWidth = contentRect.width() * resolution / h;
+            desiredHeight = contentRect.height() * resolution / h;
+            desiredWidth = (desiredWidth + 4) & ~7;
+            desiredHeight = (desiredHeight + 4) & ~7;
+        } else {
+            desiredWidth &= ~7;
+            desiredHeight &= ~7;
+        }
+        Ln.i("realWidth: " + realWidth + ", realHeight: " + realHeight + ", desiredWidth: " + desiredWidth + ", desiredHeight: " + desiredHeight);
+        return new Rect(0, 0, desiredWidth, desiredHeight);
+    }
+
+    private void writeMinicapBanner(Device device, SocketChannel fd, int scale) throws IOException {
+        final byte BANNER_SIZE = 24;
+        final byte version = 1;
+        final byte quirks = 2;
+        int pid = Process.myPid();
+        Rect contentRect = device.getScreenInfo().getContentRect();
+        Rect videoRect = getDesiredSize(contentRect, scale);
+        int realWidth = contentRect.width();
+        int realHeight = contentRect.height();
+        int desiredWidth = videoRect.width();
+        int desiredHeight = videoRect.height();
+        byte orientation = (byte) device.getRotation();
+
+        ByteBuffer b = ByteBuffer.allocate(BANNER_SIZE);
+        b.order(ByteOrder.LITTLE_ENDIAN);
+        b.put((byte) version);//version
+        b.put(BANNER_SIZE);//banner size
+        b.putInt(pid);//pid
+        b.putInt(realWidth);//real width
+        b.putInt(realHeight);//real height
+        b.putInt(desiredWidth);//desired width
+        b.putInt(desiredHeight);//desired height
+        b.put((byte) orientation);//orientation
+        b.put((byte) quirks);//quirks
+        byte[] array = b.array();
+        IO.writeFully(fd, array, 0, array.length);// IOException
+        Ln.i("banner\n"
+                + "{\n"
+                + "    version: " + version + "\n"
+                + "    size: " + BANNER_SIZE + "\n"
+                + "    real width: " + realWidth + "\n"
+                + "    real height: " + realHeight + "\n"
+                + "    desired width: " + desiredWidth + "\n"
+                + "    desired height: " + desiredHeight + "\n"
+                + "    orientation: " + orientation + "\n"
+                + "    quirks: " + quirks + "\n"
+                + "}\n"
+        );
+    }
+
     private static void configure(MediaCodec codec, MediaFormat format) {
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
     }
@@ -298,7 +599,26 @@ public class ScreenEncoder implements Device.RotationListener {
         }
     }
 
+    private static void setDisplaySurface(IBinder display, Surface surface, Rect deviceRect, Rect displayRect) {
+        SurfaceControl.openTransaction();
+        try {
+            SurfaceControl.setDisplaySurface(display, surface);
+            SurfaceControl.setDisplayProjection(display, 0, deviceRect, displayRect);
+            SurfaceControl.setDisplayLayerStack(display, 0);
+        } finally {
+            SurfaceControl.closeTransaction();
+        }
+    }
+
     private static void destroyDisplay(IBinder display) {
         SurfaceControl.destroyDisplay(display);
+    }
+
+    private synchronized boolean getAlive() {
+        return alive;
+    }
+
+    private synchronized void setAlive(boolean b) {
+        alive = b;
     }
 }
